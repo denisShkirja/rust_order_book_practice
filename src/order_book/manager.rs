@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 use std::fmt::Display;
 
-use crate::l2_order_book::buffered_order_book::BufferedOrderBook;
-use crate::l2_order_book::errors::Errors;
-use crate::l2_order_book::order_book::OrderBook;
+use crate::order_book::buffered_order_book::BufferedOrderBook;
+use crate::order_book::errors::Errors;
+use crate::order_book::order_book::OrderBook;
 use crate::parsing::order_book_snapshot::OrderBookSnapshot;
 use crate::parsing::order_book_update::OrderBookUpdate;
 
@@ -48,51 +48,55 @@ impl Display for Manager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parsing::order_book_snapshot::Level;
-    use crate::parsing::order_book_update::Update;
+    use crate::generational_deque::generation_guard::GenerationGuard;
+    use crate::generational_deque::generational_deque::GenerationalDeque;
+    use crate::parsing::order_book_snapshot::Level as SnapshotLevel;
+    use crate::parsing::order_book_update::Level as UpdateLevel;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     fn create_test_snapshot(security_id: u64, seq_no: u64) -> OrderBookSnapshot {
         OrderBookSnapshot {
             timestamp: 1627846265,
             seq_no,
             security_id,
-            bid1: Level {
+            bid1: SnapshotLevel {
                 price: 100.00,
                 qty: 10,
             },
-            ask1: Level {
+            ask1: SnapshotLevel {
                 price: 101.00,
                 qty: 15,
             },
-            bid2: Level {
+            bid2: SnapshotLevel {
                 price: 99.00,
                 qty: 20,
             },
-            ask2: Level {
+            ask2: SnapshotLevel {
                 price: 102.00,
                 qty: 25,
             },
-            bid3: Level {
+            bid3: SnapshotLevel {
                 price: 98.00,
                 qty: 30,
             },
-            ask3: Level {
+            ask3: SnapshotLevel {
                 price: 103.00,
                 qty: 35,
             },
-            bid4: Level {
+            bid4: SnapshotLevel {
                 price: 97.00,
                 qty: 40,
             },
-            ask4: Level {
+            ask4: SnapshotLevel {
                 price: 104.00,
                 qty: 45,
             },
-            bid5: Level {
+            bid5: SnapshotLevel {
                 price: 96.00,
                 qty: 50,
             },
-            ask5: Level {
+            ask5: SnapshotLevel {
                 price: 105.00,
                 qty: 55,
             },
@@ -100,22 +104,33 @@ mod tests {
     }
 
     fn create_test_update(security_id: u64, seq_no: u64) -> OrderBookUpdate {
+        // Create a deque and add test levels
+        let deque = Rc::new(RefCell::new(GenerationalDeque::new(10)));
+        let start_index = deque.borrow().end_index();
+
+        {
+            let mut deque_ref = deque.borrow_mut();
+            // Add bid level
+            deque_ref.push_back(UpdateLevel {
+                side: 0,
+                price: 99.00,
+                qty: 25,
+                seq_no,
+            });
+            // Add ask level
+            deque_ref.push_back(UpdateLevel {
+                side: 1,
+                price: 101.00,
+                qty: 30,
+                seq_no,
+            });
+        }
+
         OrderBookUpdate {
             timestamp: 1627846266,
             seq_no,
             security_id,
-            updates: vec![
-                Update {
-                    side: 0,
-                    price: 99.00,
-                    qty: 25,
-                },
-                Update {
-                    side: 1,
-                    price: 101.00,
-                    qty: 30,
-                },
-            ],
+            updates: GenerationGuard::new(Rc::clone(&deque), start_index, 2, seq_no as usize),
         }
     }
 

@@ -2,17 +2,18 @@ use clap::Parser;
 use std::fmt::Debug;
 use std::fs::File;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
-mod l2_order_book;
+mod generational_deque;
+mod order_book;
 mod parsing;
 
-use binread::BinRead;
-use l2_order_book::errors::Errors as OrderBookErrors;
-use l2_order_book::manager::Manager as OrderBookManager;
+use order_book::errors::Errors as OrderBookErrors;
+use order_book::manager::Manager as OrderBookManager;
 use parsing::binary_file_iterator::BinaryFileIterator;
 use parsing::order_book_snapshot::OrderBookSnapshot;
 use parsing::order_book_update::OrderBookUpdate;
-use std::process::ExitCode;
+use parsing::parser::DefaultParser;
 
 #[derive(Parser, Debug)]
 #[clap(about = "Processes snapshot and incremental files")]
@@ -23,7 +24,7 @@ struct Args {
     verbose: bool,
 }
 
-fn print_records_from_file<T: BinRead + Debug>(path: &PathBuf) {
+fn print_records_from_file<T: Debug + DefaultParser<T>>(path: &PathBuf) {
     println!("Printing records from file: {}", path.display());
     let file = File::open(path);
     if file.is_err() {
@@ -75,7 +76,7 @@ impl ApplyToOrderBook for OrderBookUpdate {
     }
 }
 
-fn apply_order_book_records_from_file<T: BinRead + Debug + ApplyToOrderBook>(
+fn apply_order_book_records_from_file<T: ApplyToOrderBook + DefaultParser<T>>(
     path: &PathBuf,
     order_book_manager: &mut OrderBookManager,
 ) -> bool {

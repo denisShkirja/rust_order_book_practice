@@ -1,22 +1,22 @@
-use crate::l2_order_book::errors::Errors;
-use crate::l2_order_book::order_book::OrderBook;
+use crate::order_book::errors::Errors;
+use crate::order_book::order_book::OrderBook;
 use crate::parsing::order_book_snapshot::OrderBookSnapshot;
 use crate::parsing::order_book_update::OrderBookUpdate;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fmt::Display;
 
 pub struct BufferedOrderBook {
     pub order_book: OrderBook,
-    pub pending_updates: BTreeMap<u64, OrderBookUpdate>,
+    pub pending_updates: HashMap<u64, OrderBookUpdate>,
 }
 
 impl BufferedOrderBook {
-    pub const MAX_PENDING_UPDATES: usize = 1000;
+    pub const MAX_PENDING_UPDATES: usize = 10000;
 
     pub fn new(order_book: OrderBook) -> Self {
         Self {
             order_book,
-            pending_updates: BTreeMap::new(),
+            pending_updates: HashMap::new(),
         }
     }
 
@@ -29,8 +29,10 @@ impl BufferedOrderBook {
             Err(e) => match e {
                 Errors::SequenceNumberGap => {
                     if self.pending_updates.len() >= Self::MAX_PENDING_UPDATES {
-                        // Drop the oldest update (smallest sequence number)
-                        self.pending_updates.pop_first();
+                        // In the real world, with the snapshot and update streams open,
+                        // this most likely means that most of the updates are old and we
+                        // can just drop them because the next snapshot will include them all.
+                        self.pending_updates.clear();
                     }
                     self.pending_updates.insert(update.seq_no, update);
                     Err(e)
@@ -41,8 +43,14 @@ impl BufferedOrderBook {
     }
 
     pub fn apply_snapshot(&mut self, snapshot: &OrderBookSnapshot) -> Result<(), Errors> {
+        let old_seq_no = self.order_book.seq_no;
+
         match self.order_book.apply_snapshot(snapshot) {
             Ok(_) => {
+                // Remove all pending updates that are now in the snapshot
+                for seq_no in old_seq_no..snapshot.seq_no {
+                    self.pending_updates.remove(&seq_no);
+                }
                 self.try_apply_pending_updates();
                 Ok(())
             }
@@ -51,33 +59,15 @@ impl BufferedOrderBook {
     }
 
     fn try_apply_pending_updates(&mut self) {
-        let mut last_successful_key = None;
-        for (key, update) in &self.pending_updates {
-            match self.order_book.apply_update(update) {
-                Ok(_) => {
-                    last_successful_key = Some(*key);
+        loop {
+            let next_seq_no = self.order_book.seq_no + 1;
+
+            if let Some(update) = self.pending_updates.remove(&next_seq_no) {
+                if self.order_book.apply_update(&update).is_err() {
+                    break;
                 }
-                Err(e) => match e {
-                    Errors::OldSequenceNumber => {
-                        last_successful_key = Some(*key);
-                    }
-                    _ => break,
-                },
-            }
-        }
-        if let Some(key) = last_successful_key {
-            // Find the next key strictly greater than last_successful_key
-            if let Some(&next_key) = self
-                .pending_updates
-                .range((key + 1)..)
-                .map(|(k, _)| k)
-                .next()
-            {
-                // Split at the next key, keeping only elements with keys >= next_key
-                self.pending_updates = self.pending_updates.split_off(&next_key);
             } else {
-                // No keys greater than last_successful_key, so clear the map
-                self.pending_updates.clear();
+                break;
             }
         }
     }
@@ -93,51 +83,55 @@ impl Display for BufferedOrderBook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parsing::order_book_snapshot::Level;
-    use crate::parsing::order_book_update::Update;
+    use crate::generational_deque::generation_guard::GenerationGuard;
+    use crate::generational_deque::generational_deque::GenerationalDeque;
+    use crate::parsing::order_book_snapshot::Level as SnapshotLevel;
+    use crate::parsing::order_book_update::Level as UpdateLevel;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     fn create_test_snapshot(security_id: u64, seq_no: u64) -> OrderBookSnapshot {
         OrderBookSnapshot {
             timestamp: 1627846265,
             seq_no,
             security_id,
-            bid1: Level {
+            bid1: SnapshotLevel {
                 price: 100.00,
                 qty: 10,
             },
-            ask1: Level {
+            ask1: SnapshotLevel {
                 price: 101.00,
                 qty: 15,
             },
-            bid2: Level {
+            bid2: SnapshotLevel {
                 price: 99.00,
                 qty: 20,
             },
-            ask2: Level {
+            ask2: SnapshotLevel {
                 price: 102.00,
                 qty: 25,
             },
-            bid3: Level {
+            bid3: SnapshotLevel {
                 price: 98.00,
                 qty: 30,
             },
-            ask3: Level {
+            ask3: SnapshotLevel {
                 price: 103.00,
                 qty: 35,
             },
-            bid4: Level {
+            bid4: SnapshotLevel {
                 price: 97.00,
                 qty: 40,
             },
-            ask4: Level {
+            ask4: SnapshotLevel {
                 price: 104.00,
                 qty: 45,
             },
-            bid5: Level {
+            bid5: SnapshotLevel {
                 price: 96.00,
                 qty: 50,
             },
-            ask5: Level {
+            ask5: SnapshotLevel {
                 price: 105.00,
                 qty: 55,
             },
@@ -145,22 +139,33 @@ mod tests {
     }
 
     fn create_test_update(security_id: u64, seq_no: u64) -> OrderBookUpdate {
+        // Create a deque and add test levels
+        let deque = Rc::new(RefCell::new(GenerationalDeque::new(10)));
+        let start_index = deque.borrow().end_index();
+
+        {
+            let mut deque_ref = deque.borrow_mut();
+            // Add bid level
+            deque_ref.push_back(UpdateLevel {
+                side: 0,
+                price: 99.50,
+                qty: 25,
+                seq_no,
+            });
+            // Add ask level
+            deque_ref.push_back(UpdateLevel {
+                side: 1,
+                price: 100.50,
+                qty: 30,
+                seq_no,
+            });
+        }
+
         OrderBookUpdate {
             timestamp: 1627846266,
             seq_no,
             security_id,
-            updates: vec![
-                Update {
-                    side: 0,
-                    price: 99.50,
-                    qty: 25,
-                },
-                Update {
-                    side: 1,
-                    price: 100.50,
-                    qty: 30,
-                },
-            ],
+            updates: GenerationGuard::new(Rc::clone(&deque), start_index, 2, seq_no as usize),
         }
     }
 
@@ -208,13 +213,17 @@ mod tests {
         let result = buffered_book.apply_update(update);
         assert!(matches!(result, Err(Errors::SequenceNumberGap)));
 
+        let update = create_test_update(security_id, 104);
+        let result = buffered_book.apply_update(update);
+        assert!(matches!(result, Err(Errors::SequenceNumberGap)));
+
         // Apply a new snapshot with a higher sequence number
-        let snapshot2 = create_test_snapshot(security_id, 101);
+        let snapshot2 = create_test_snapshot(security_id, 103);
         let result = buffered_book.apply_snapshot(&snapshot2);
 
         // Should apply pending update after snapshot
         assert!(result.is_ok());
-        assert_eq!(buffered_book.order_book.seq_no, 102);
+        assert_eq!(buffered_book.order_book.seq_no, 104);
         assert!(buffered_book.pending_updates.is_empty());
     }
 
@@ -266,30 +275,14 @@ mod tests {
             BufferedOrderBook::MAX_PENDING_UPDATES
         );
 
-        // Add 5 more updates which should cause the oldest ones to be dropped
-        for i in 0..5 {
-            let seq_no = start_seq + BufferedOrderBook::MAX_PENDING_UPDATES as u64 + i;
-            let update = create_test_update(security_id, seq_no);
-            buffered_book.apply_update(update).unwrap_err();
-        }
+        // Add one more update which should cause all previous updates to be cleared
+        let new_seq_no = start_seq + BufferedOrderBook::MAX_PENDING_UPDATES as u64;
+        let new_update = create_test_update(security_id, new_seq_no);
+        buffered_book.apply_update(new_update).unwrap_err();
 
-        // Still should have MAX_PENDING_UPDATES
-        assert_eq!(
-            buffered_book.pending_updates.len(),
-            BufferedOrderBook::MAX_PENDING_UPDATES
-        );
-
-        // The first 5 keys should be dropped
-        for i in 0..5 {
-            let seq_no = start_seq + i as u64;
-            assert!(!buffered_book.pending_updates.contains_key(&seq_no));
-        }
-
-        // The last 5 keys should be present
-        for i in 0..5 {
-            let seq_no = start_seq + BufferedOrderBook::MAX_PENDING_UPDATES as u64 + i;
-            assert!(buffered_book.pending_updates.contains_key(&seq_no));
-        }
+        // Should now just have the single new update
+        assert_eq!(buffered_book.pending_updates.len(), 1);
+        assert!(buffered_book.pending_updates.contains_key(&new_seq_no));
     }
 
     #[test]

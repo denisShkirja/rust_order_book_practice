@@ -1,12 +1,12 @@
-use chrono;
 use num_traits::FromPrimitive;
 use rust_decimal::{Decimal, dec};
 use std::collections::BTreeMap;
 use std::fmt::Display;
 
-use crate::l2_order_book::errors::Errors;
-use crate::l2_order_book::errors::UpdateMessageInfo;
+use crate::order_book::errors::Errors;
+use crate::order_book::errors::UpdateMessageInfo;
 use crate::parsing::order_book_snapshot::OrderBookSnapshot;
+use crate::parsing::order_book_update::Level as UpdateLevel;
 use crate::parsing::order_book_update::OrderBookUpdate;
 
 #[derive(Debug)]
@@ -54,22 +54,25 @@ impl OrderBook {
         self.bid_updates.clear();
 
         // Prepare updates
-        for upd in &update.updates {
-            let price = Self::normalized_price(update.security_id, update.seq_no, upd.price)?;
-            match upd.side {
-                0 => self.bid_updates.push((price, upd.qty)),
-                1 => self.ask_updates.push((price, upd.qty)),
-                _ => {
-                    return Err(Errors::InvalidSide(
-                        UpdateMessageInfo {
-                            security_id: update.security_id,
-                            seq_no: update.seq_no,
-                        },
-                        format!("{}", upd.side),
-                    ));
+        update
+            .updates
+            .for_each(|upd: &UpdateLevel| -> Result<(), Errors> {
+                let price = Self::normalized_price(update.security_id, update.seq_no, upd.price)?;
+                match upd.side {
+                    0 => self.bid_updates.push((price, upd.qty)),
+                    1 => self.ask_updates.push((price, upd.qty)),
+                    _ => {
+                        return Err(Errors::InvalidSide(
+                            UpdateMessageInfo {
+                                security_id: update.security_id,
+                                seq_no: update.seq_no,
+                            },
+                            format!("{}", upd.side),
+                        ));
+                    }
                 }
-            }
-        }
+                Ok(())
+            })?;
 
         // Apply updates atomically
         for (price, qty) in self.bid_updates.drain(..) {
@@ -253,51 +256,54 @@ impl Display for OrderBook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parsing::order_book_snapshot::Level;
-    use crate::parsing::order_book_update::Update;
+    use crate::generational_deque::generation_guard::GenerationGuard;
+    use crate::generational_deque::generational_deque::GenerationalDeque;
+    use crate::parsing::order_book_snapshot::Level as SnapshotLevel;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     fn create_test_snapshot(security_id: u64, seq_no: u64) -> OrderBookSnapshot {
         OrderBookSnapshot {
             timestamp: 1627846265,
             seq_no,
             security_id,
-            bid1: Level {
+            bid1: SnapshotLevel {
                 price: 100.00,
                 qty: 10,
             },
-            ask1: Level {
+            ask1: SnapshotLevel {
                 price: 101.00,
                 qty: 15,
             },
-            bid2: Level {
+            bid2: SnapshotLevel {
                 price: 99.00,
                 qty: 20,
             },
-            ask2: Level {
+            ask2: SnapshotLevel {
                 price: 102.00,
                 qty: 25,
             },
-            bid3: Level {
+            bid3: SnapshotLevel {
                 price: 98.00,
                 qty: 30,
             },
-            ask3: Level {
+            ask3: SnapshotLevel {
                 price: 103.00,
                 qty: 35,
             },
-            bid4: Level {
+            bid4: SnapshotLevel {
                 price: 97.00,
                 qty: 40,
             },
-            ask4: Level {
+            ask4: SnapshotLevel {
                 price: 104.00,
                 qty: 45,
             },
-            bid5: Level {
+            bid5: SnapshotLevel {
                 price: 96.00,
                 qty: 50,
             },
-            ask5: Level {
+            ask5: SnapshotLevel {
                 price: 105.00,
                 qty: 55,
             },
@@ -305,22 +311,33 @@ mod tests {
     }
 
     fn create_test_update(security_id: u64, seq_no: u64) -> OrderBookUpdate {
+        // Create a deque and add test levels
+        let deque = Rc::new(RefCell::new(GenerationalDeque::new(10)));
+        let start_index = deque.borrow().end_index();
+
+        {
+            let mut deque_ref = deque.borrow_mut();
+            // Add bid level
+            deque_ref.push_back(UpdateLevel {
+                side: 0,
+                price: 99.50,
+                qty: 25,
+                seq_no,
+            });
+            // Add ask level
+            deque_ref.push_back(UpdateLevel {
+                side: 1,
+                price: 100.50,
+                qty: 30,
+                seq_no,
+            });
+        }
+
         OrderBookUpdate {
             timestamp: 1627846266,
             seq_no,
             security_id,
-            updates: vec![
-                Update {
-                    side: 0,
-                    price: 99.50,
-                    qty: 25,
-                },
-                Update {
-                    side: 1,
-                    price: 100.50,
-                    qty: 30,
-                },
-            ],
+            updates: GenerationGuard::new(Rc::clone(&deque), start_index, 2, seq_no as usize),
         }
     }
 
@@ -429,9 +446,35 @@ mod tests {
         let mut order_book = OrderBook::new(&snapshot).unwrap();
 
         // Apply an update with an invalid price
-        let mut invalid_update = create_test_update(security_id, 101);
-        // Make price invalid by setting it to a non-multiple of PRICE_TICK
-        invalid_update.updates[1].price += 0.005;
+        // Create a deque and add test levels with an invalid price
+        let deque = Rc::new(RefCell::new(GenerationalDeque::new(10)));
+        let start_index = deque.borrow().end_index();
+
+        {
+            let mut deque_ref = deque.borrow_mut();
+            // Add bid level
+            deque_ref.push_back(UpdateLevel {
+                side: 0,
+                price: 99.50,
+                qty: 25,
+                seq_no: 101,
+            });
+            // Add ask level with invalid price (not a multiple of PRICE_TICK)
+            deque_ref.push_back(UpdateLevel {
+                side: 1,
+                price: 100.505, // Invalid price
+                qty: 30,
+                seq_no: 101,
+            });
+        }
+
+        let invalid_update = OrderBookUpdate {
+            timestamp: 1627846266,
+            seq_no: 101,
+            security_id,
+            updates: GenerationGuard::new(Rc::clone(&deque), start_index, 2, 101),
+        };
+
         let result = order_book.apply_update(&invalid_update);
 
         assert!(matches!(result, Err(Errors::InvalidPrice(_, _))));
@@ -447,9 +490,35 @@ mod tests {
         let mut order_book = OrderBook::new(&snapshot).unwrap();
 
         // Apply an update with an invalid price
-        let mut invalid_update = create_test_update(security_id, 101);
-        // Make price invalid by setting it to NaN
-        invalid_update.updates[1].price = f64::NAN;
+        // Create a deque and add test levels with a NaN price
+        let deque = Rc::new(RefCell::new(GenerationalDeque::new(10)));
+        let start_index = deque.borrow().end_index();
+
+        {
+            let mut deque_ref = deque.borrow_mut();
+            // Add bid level
+            deque_ref.push_back(UpdateLevel {
+                side: 0,
+                price: 99.50,
+                qty: 25,
+                seq_no: 101,
+            });
+            // Add ask level with NaN price
+            deque_ref.push_back(UpdateLevel {
+                side: 1,
+                price: f64::NAN, // Invalid price
+                qty: 30,
+                seq_no: 101,
+            });
+        }
+
+        let invalid_update = OrderBookUpdate {
+            timestamp: 1627846266,
+            seq_no: 101,
+            security_id,
+            updates: GenerationGuard::new(Rc::clone(&deque), start_index, 2, 101),
+        };
+
         let result = order_book.apply_update(&invalid_update);
 
         assert!(matches!(result, Err(Errors::InvalidPrice(_, _))));
@@ -465,9 +534,35 @@ mod tests {
         let mut order_book = OrderBook::new(&snapshot).unwrap();
 
         // Apply an update with an invalid side
-        let mut invalid_update = create_test_update(security_id, 101);
-        // Make side invalid by setting it to a value other than 0 or 1
-        invalid_update.updates[1].side = 2;
+        // Create a deque and add test levels with an invalid side
+        let deque = Rc::new(RefCell::new(GenerationalDeque::new(10)));
+        let start_index = deque.borrow().end_index();
+
+        {
+            let mut deque_ref = deque.borrow_mut();
+            // Add bid level
+            deque_ref.push_back(UpdateLevel {
+                side: 0,
+                price: 99.50,
+                qty: 25,
+                seq_no: 101,
+            });
+            // Add level with invalid side
+            deque_ref.push_back(UpdateLevel {
+                side: 2, // Invalid side (not 0 or 1)
+                price: 100.50,
+                qty: 30,
+                seq_no: 101,
+            });
+        }
+
+        let invalid_update = OrderBookUpdate {
+            timestamp: 1627846266,
+            seq_no: 101,
+            security_id,
+            updates: GenerationGuard::new(Rc::clone(&deque), start_index, 2, 101),
+        };
+
         let result = order_book.apply_update(&invalid_update);
 
         assert!(matches!(result, Err(Errors::InvalidSide(_, _))));
@@ -541,11 +636,26 @@ mod tests {
         let mut order_book = OrderBook::new(&snapshot).unwrap();
 
         // Create an update that sets quantity to 0 for a specific price level
-        let mut update = create_test_update(security_id, 101);
-        update.updates[0] = Update {
-            side: 0,
-            price: 100.00,
-            qty: 0,
+        // Create a deque with a level that has qty=0
+        let deque = Rc::new(RefCell::new(GenerationalDeque::new(10)));
+        let start_index = deque.borrow().end_index();
+
+        {
+            let mut deque_ref = deque.borrow_mut();
+            // Add bid level with zero quantity to remove the price level
+            deque_ref.push_back(UpdateLevel {
+                side: 0,
+                price: 100.00, // This price exists in the initial snapshot
+                qty: 0,        // Setting to 0 should remove it
+                seq_no: 101,
+            });
+        }
+
+        let update = OrderBookUpdate {
+            timestamp: 1627846266,
+            seq_no: 101,
+            security_id,
+            updates: GenerationGuard::new(Rc::clone(&deque), start_index, 1, 101),
         };
 
         // Apply the update
@@ -566,10 +676,34 @@ mod tests {
         let mut order_book = OrderBook::new(&snapshot).unwrap();
 
         // First try to apply an update with an invalid price
-        let mut invalid_update = create_test_update(security_id, 101);
-        invalid_update.updates[0].price = 98.50;
-        // Make price invalid by setting it to a non-multiple of PRICE_TICK
-        invalid_update.updates[1].price = 100.505;
+        let deque = Rc::new(RefCell::new(GenerationalDeque::new(10)));
+        let start_index = deque.borrow().end_index();
+
+        {
+            let mut deque_ref = deque.borrow_mut();
+            // Add bid level with valid price
+            deque_ref.push_back(UpdateLevel {
+                side: 0,
+                price: 98.50,
+                qty: 25,
+                seq_no: 101,
+            });
+            // Add ask level with invalid price
+            deque_ref.push_back(UpdateLevel {
+                side: 1,
+                price: 100.505, // Invalid price (not a multiple of PRICE_TICK)
+                qty: 30,
+                seq_no: 101,
+            });
+        }
+
+        let invalid_update = OrderBookUpdate {
+            timestamp: 1627846266,
+            seq_no: 101,
+            security_id,
+            updates: GenerationGuard::new(Rc::clone(&deque), start_index, 2, 101),
+        };
+
         let result = order_book.apply_update(&invalid_update);
         assert!(matches!(result, Err(Errors::InvalidPrice(_, _))));
 
@@ -580,7 +714,14 @@ mod tests {
 
         assert_eq!(order_book.seq_no, 101);
 
-        // Check that the level from the invalid update is not present
+        // Check that the bid from the valid update is present at 99.50
+        assert!(
+            order_book
+                .bids
+                .contains_key(&Decimal::from_f64(99.50).unwrap())
+        );
+
+        // Verify the 98.50 price level is not in the bids (from the invalid update)
         assert!(
             !order_book
                 .bids
