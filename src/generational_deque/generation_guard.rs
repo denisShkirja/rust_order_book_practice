@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 #[derive(Debug)]
 pub struct GenerationGuard<T: Item> {
-    deque: Rc<RefCell<GenerationalDeque<T>>>,
+    deque: Option<Rc<RefCell<GenerationalDeque<T>>>>,
     start_index: usize,
     count: usize,
     generation: usize,
@@ -19,19 +19,25 @@ impl<T: Item> GenerationGuard<T> {
         generation: usize,
     ) -> Self {
         Self {
-            deque,
+            deque: Some(deque),
             start_index,
             count,
             generation,
         }
     }
 
+    pub fn drop_ownership(&mut self) {
+        self.deque = None;
+    }
+
     pub fn for_each<E>(&self, mut f: impl FnMut(&T) -> Result<(), E>) -> Result<(), E> {
-        let deque = self.deque.borrow();
-        for i in 0..self.count {
-            let index = self.start_index + i;
-            if let Some(item) = deque.get(index) {
-                f(item)?;
+        if let Some(deque) = &self.deque {
+            let deque = deque.borrow();
+            for i in 0..self.count {
+                let index = self.start_index + i;
+                if let Some(item) = deque.get(index) {
+                    f(item)?;
+                }
             }
         }
         Ok(())
@@ -40,9 +46,11 @@ impl<T: Item> GenerationGuard<T> {
 
 impl<T: Item> Drop for GenerationGuard<T> {
     fn drop(&mut self) {
-        self.deque
-            .borrow_mut()
-            .remove_expired_generations(self.generation);
+        if let Some(deque) = &self.deque {
+            deque
+                .borrow_mut()
+                .remove_expired_generations(self.generation);
+        }
     }
 }
 
@@ -188,5 +196,68 @@ mod tests {
 
             // guard1 is dropped here, but all items <= generation 1 are already removed
         }
+    }
+
+    #[test]
+    fn test_unordered_generations() {
+        let deque = Rc::new(RefCell::new(GenerationalDeque::new(10)));
+        deque.borrow_mut().push_back(TestItem {
+            id: 3,
+            generation: 3,
+        });
+        deque.borrow_mut().push_back(TestItem {
+            id: 2,
+            generation: 2,
+        });
+        deque.borrow_mut().push_back(TestItem {
+            id: 1,
+            generation: 1,
+        });
+
+        // Drop generation 1, nothing should be removed
+        {
+            let _guard1 = GenerationGuard::new(deque.clone(), 2, 1, 1);
+        }
+        assert_eq!(deque.borrow().get(0).unwrap().id, 3);
+        assert_eq!(deque.borrow().get(1).unwrap().id, 2);
+        assert_eq!(deque.borrow().get(2).unwrap().id, 1);
+
+        // Drop generation 2, nothing should be removed
+        {
+            let _guard1 = GenerationGuard::new(deque.clone(), 1, 1, 2);
+        }
+        assert_eq!(deque.borrow().get(0).unwrap().id, 3);
+        assert_eq!(deque.borrow().get(1).unwrap().id, 2);
+        assert_eq!(deque.borrow().get(2).unwrap().id, 1);
+
+        // Drop generation 3, all items should be removed
+        {
+            let _guard1 = GenerationGuard::new(deque.clone(), 0, 1, 3);
+        }
+        assert!(deque.borrow().get(0).is_none());
+        assert!(deque.borrow().get(1).is_none());
+        assert!(deque.borrow().get(2).is_none());
+    }
+
+    #[test]
+    fn test_drop_ownership() {
+        let deque = setup_test_deque();
+
+        // Confirm initial state
+        assert_eq!(deque.borrow().get(0).unwrap().id, 1);
+        assert_eq!(deque.borrow().get(1).unwrap().id, 2);
+        assert_eq!(deque.borrow().get(2).unwrap().id, 3);
+        assert_eq!(deque.borrow().get(3).unwrap().id, 4);
+
+        {
+            let mut guard = GenerationGuard::new(deque.clone(), 3, 1, 3);
+            guard.drop_ownership();
+        }
+
+        // Verify items are still in the deque (nothing was removed)
+        assert_eq!(deque.borrow().get(0).unwrap().id, 1);
+        assert_eq!(deque.borrow().get(1).unwrap().id, 2);
+        assert_eq!(deque.borrow().get(2).unwrap().id, 3);
+        assert_eq!(deque.borrow().get(3).unwrap().id, 4);
     }
 }

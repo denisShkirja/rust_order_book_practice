@@ -34,7 +34,14 @@ impl BufferedOrderBook {
                         // can just drop them because the next snapshot will include them all.
                         self.pending_updates.clear();
                     }
-                    self.pending_updates.insert(update.seq_no, update);
+                    if let Some(mut duplicate_update) =
+                        self.pending_updates.insert(update.seq_no, update)
+                    {
+                        // Destructor of the GenerationGuard deletes all updates in the deque
+                        // with the same or older generation, but we still need them here because
+                        // they are not yet applied.
+                        duplicate_update.updates.drop_ownership();
+                    }
                     Err(e)
                 }
                 _ => Err(e),
@@ -87,6 +94,8 @@ mod tests {
     use crate::generational_deque::generational_deque::GenerationalDeque;
     use crate::parsing::order_book_snapshot::Level as SnapshotLevel;
     use crate::parsing::order_book_update::Level as UpdateLevel;
+    use num_traits::FromPrimitive;
+    use rust_decimal::Decimal;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -330,5 +339,127 @@ mod tests {
         // Check that the update with seq_no 105 is still in pending
         assert_eq!(buffered_book.pending_updates.len(), 1);
         assert!(buffered_book.pending_updates.contains_key(&105));
+    }
+
+    #[test]
+    fn test_buffered_duplicate_update_handling() {
+        let security_id = 1001;
+        let snapshot = create_test_snapshot(security_id, 100);
+        let order_book = OrderBook::new(&snapshot).unwrap();
+        let mut buffered_book = BufferedOrderBook::new(order_book);
+
+        // Create an update with a sequence number gap
+        let deque = Rc::new(RefCell::new(GenerationalDeque::new(10)));
+        let update102 = {
+            let start_index = deque.borrow().end_index();
+            deque.borrow_mut().push_back(UpdateLevel {
+                side: 0,
+                price: 99.51,
+                qty: 100,
+                seq_no: 102,
+            });
+            OrderBookUpdate {
+                timestamp: 1627846266,
+                seq_no: 102,
+                security_id,
+                updates: GenerationGuard::new(Rc::clone(&deque), start_index, 1, 102_usize),
+            }
+        };
+        let result = buffered_book.apply_update(update102);
+        // Should be added to pending updates
+        assert!(matches!(result, Err(Errors::SequenceNumberGap)));
+        assert_eq!(buffered_book.pending_updates.len(), 1);
+        assert!(buffered_book.pending_updates.contains_key(&102));
+
+        // Create another update with a sequence number gap
+        let update103 = {
+            let start_index = deque.borrow().end_index();
+            deque.borrow_mut().push_back(UpdateLevel {
+                side: 0,
+                price: 99.50,
+                qty: 200,
+                seq_no: 103,
+            });
+            OrderBookUpdate {
+                timestamp: 1627846266,
+                seq_no: 103,
+                security_id,
+                updates: GenerationGuard::new(Rc::clone(&deque), start_index, 1, 103_usize),
+            }
+        };
+        let result = buffered_book.apply_update(update103);
+        // Should be added to pending updates
+        assert!(matches!(result, Err(Errors::SequenceNumberGap)));
+        assert_eq!(buffered_book.pending_updates.len(), 2);
+        assert!(buffered_book.pending_updates.contains_key(&102));
+        assert!(buffered_book.pending_updates.contains_key(&103));
+
+        // Create duplicate update with the same sequence number
+        let update103 = {
+            let start_index = deque.borrow().end_index();
+            deque.borrow_mut().push_back(UpdateLevel {
+                side: 0,
+                price: 99.50,
+                qty: 200,
+                seq_no: 103,
+            });
+            OrderBookUpdate {
+                timestamp: 1627846266,
+                seq_no: 103,
+                security_id,
+                updates: GenerationGuard::new(Rc::clone(&deque), start_index, 1, 103_usize),
+            }
+        };
+        let result = buffered_book.apply_update(update103);
+        // Still should have only two pending updates
+        assert!(matches!(result, Err(Errors::SequenceNumberGap)));
+        assert_eq!(buffered_book.pending_updates.len(), 2);
+        assert!(buffered_book.pending_updates.contains_key(&102));
+        assert!(buffered_book.pending_updates.contains_key(&103));
+
+        // Now fill the gap and apply pending updates
+        let update101 = {
+            let start_index = deque.borrow().end_index();
+            deque.borrow_mut().push_back(UpdateLevel {
+                side: 0,
+                price: 99.52,
+                qty: 99,
+                seq_no: 101,
+            });
+            OrderBookUpdate {
+                timestamp: 1627846266,
+                seq_no: 101,
+                security_id,
+                updates: GenerationGuard::new(Rc::clone(&deque), start_index, 1, 101_usize),
+            }
+        };
+        let result = buffered_book.apply_update(update101);
+        // Should successfully apply both the gap-filling update and the pending update
+        assert!(result.is_ok());
+        assert_eq!(buffered_book.order_book.seq_no, 103);
+        assert!(buffered_book.pending_updates.is_empty());
+
+        // Check that all price levels from the pending updates exist in the order book
+        assert_eq!(
+            buffered_book
+                .order_book
+                .bids
+                .get(&Decimal::from_f64(99.51).unwrap()),
+            Some(&100)
+        );
+        assert_eq!(
+            buffered_book
+                .order_book
+                .bids
+                .get(&Decimal::from_f64(99.50).unwrap()),
+            Some(&200)
+        );
+        assert_eq!(
+            buffered_book
+                .order_book
+                .bids
+                .get(&Decimal::from_f64(99.52).unwrap()),
+            Some(&99)
+        );
     }
 }
