@@ -34,14 +34,7 @@ impl BufferedOrderBook {
                         // can just drop them because the next snapshot will include them all.
                         self.pending_updates.clear();
                     }
-                    if let Some(mut duplicate_update) =
-                        self.pending_updates.insert(update.seq_no, update)
-                    {
-                        // Destructor of the GenerationGuard deletes all updates in the deque
-                        // with the same or older generation, but we still need them here because
-                        // they are not yet applied.
-                        duplicate_update.updates.drop_ownership();
-                    }
+                    self.pending_updates.insert(update.seq_no, update);
                     Err(e)
                 }
                 _ => Err(e),
@@ -90,14 +83,11 @@ impl Display for BufferedOrderBook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generational_deque::generation_guard::GenerationGuard;
-    use crate::generational_deque::generational_deque::GenerationalDeque;
+    use crate::batched_deque::batched_deque::BatchedDeque;
     use crate::parsing::order_book_snapshot::Level as SnapshotLevel;
     use crate::parsing::order_book_update::Level as UpdateLevel;
     use num_traits::FromPrimitive;
     use rust_decimal::Decimal;
-    use std::cell::RefCell;
-    use std::rc::Rc;
 
     fn create_test_snapshot(security_id: u64, seq_no: u64) -> OrderBookSnapshot {
         OrderBookSnapshot {
@@ -149,32 +139,25 @@ mod tests {
 
     fn create_test_update(security_id: u64, seq_no: u64) -> OrderBookUpdate {
         // Create a deque and add test levels
-        let deque = Rc::new(RefCell::new(GenerationalDeque::new(10)));
-        let start_index = deque.borrow().end_index();
-
-        {
-            let mut deque_ref = deque.borrow_mut();
-            // Add bid level
-            deque_ref.push_back(UpdateLevel {
+        let deque = BatchedDeque::new(10);
+        let levels: Vec<Result<UpdateLevel, ()>> = vec![
+            Ok(UpdateLevel {
                 side: 0,
                 price: 99.50,
                 qty: 25,
-                seq_no,
-            });
-            // Add ask level
-            deque_ref.push_back(UpdateLevel {
+            }),
+            Ok(UpdateLevel {
                 side: 1,
                 price: 100.50,
                 qty: 30,
-                seq_no,
-            });
-        }
+            }),
+        ];
 
         OrderBookUpdate {
             timestamp: 1627846266,
             seq_no,
             security_id,
-            updates: GenerationGuard::new(Rc::clone(&deque), start_index, 2, seq_no as usize),
+            updates: deque.push_back_batch(levels.into_iter()).unwrap(),
         }
     }
 
@@ -349,45 +332,39 @@ mod tests {
         let mut buffered_book = BufferedOrderBook::new(order_book);
 
         // Create an update with a sequence number gap
-        let deque = Rc::new(RefCell::new(GenerationalDeque::new(10)));
+        let deque = BatchedDeque::new(10);
         let update102 = {
-            let start_index = deque.borrow().end_index();
-            deque.borrow_mut().push_back(UpdateLevel {
+            let levels: Vec<Result<UpdateLevel, ()>> = vec![Ok(UpdateLevel {
                 side: 0,
                 price: 99.51,
                 qty: 100,
-                seq_no: 102,
-            });
-            OrderBookUpdate {
-                timestamp: 1627846266,
-                seq_no: 102,
-                security_id,
-                updates: GenerationGuard::new(Rc::clone(&deque), start_index, 1, 102_usize),
-            }
+            })];
+            deque.push_back_batch(levels.into_iter()).unwrap()
         };
-        let result = buffered_book.apply_update(update102);
+        let result = buffered_book.apply_update(OrderBookUpdate {
+            timestamp: 1627846266,
+            seq_no: 102,
+            security_id,
+            updates: update102,
+        });
         // Should be added to pending updates
         assert!(matches!(result, Err(Errors::SequenceNumberGap)));
         assert_eq!(buffered_book.pending_updates.len(), 1);
         assert!(buffered_book.pending_updates.contains_key(&102));
 
         // Create another update with a sequence number gap
-        let update103 = {
-            let start_index = deque.borrow().end_index();
-            deque.borrow_mut().push_back(UpdateLevel {
-                side: 0,
-                price: 99.50,
-                qty: 200,
-                seq_no: 103,
-            });
-            OrderBookUpdate {
-                timestamp: 1627846266,
-                seq_no: 103,
-                security_id,
-                updates: GenerationGuard::new(Rc::clone(&deque), start_index, 1, 103_usize),
-            }
-        };
-        let result = buffered_book.apply_update(update103);
+        let levels: Vec<Result<UpdateLevel, ()>> = vec![Ok(UpdateLevel {
+            side: 0,
+            price: 99.50,
+            qty: 200,
+        })];
+        let update103 = deque.push_back_batch(levels.into_iter()).unwrap();
+        let result = buffered_book.apply_update(OrderBookUpdate {
+            timestamp: 1627846266,
+            seq_no: 103,
+            security_id,
+            updates: update103,
+        });
         // Should be added to pending updates
         assert!(matches!(result, Err(Errors::SequenceNumberGap)));
         assert_eq!(buffered_book.pending_updates.len(), 2);
@@ -395,22 +372,18 @@ mod tests {
         assert!(buffered_book.pending_updates.contains_key(&103));
 
         // Create duplicate update with the same sequence number
-        let update103 = {
-            let start_index = deque.borrow().end_index();
-            deque.borrow_mut().push_back(UpdateLevel {
-                side: 0,
-                price: 99.50,
-                qty: 200,
-                seq_no: 103,
-            });
-            OrderBookUpdate {
-                timestamp: 1627846266,
-                seq_no: 103,
-                security_id,
-                updates: GenerationGuard::new(Rc::clone(&deque), start_index, 1, 103_usize),
-            }
-        };
-        let result = buffered_book.apply_update(update103);
+        let levels: Vec<Result<UpdateLevel, ()>> = vec![Ok(UpdateLevel {
+            side: 0,
+            price: 99.50,
+            qty: 200,
+        })];
+        let update103 = deque.push_back_batch(levels.into_iter()).unwrap();
+        let result = buffered_book.apply_update(OrderBookUpdate {
+            timestamp: 1627846266,
+            seq_no: 103,
+            security_id,
+            updates: update103,
+        });
         // Still should have only two pending updates
         assert!(matches!(result, Err(Errors::SequenceNumberGap)));
         assert_eq!(buffered_book.pending_updates.len(), 2);
@@ -418,22 +391,18 @@ mod tests {
         assert!(buffered_book.pending_updates.contains_key(&103));
 
         // Now fill the gap and apply pending updates
-        let update101 = {
-            let start_index = deque.borrow().end_index();
-            deque.borrow_mut().push_back(UpdateLevel {
-                side: 0,
-                price: 99.52,
-                qty: 99,
-                seq_no: 101,
-            });
-            OrderBookUpdate {
-                timestamp: 1627846266,
-                seq_no: 101,
-                security_id,
-                updates: GenerationGuard::new(Rc::clone(&deque), start_index, 1, 101_usize),
-            }
-        };
-        let result = buffered_book.apply_update(update101);
+        let levels: Vec<Result<UpdateLevel, ()>> = vec![Ok(UpdateLevel {
+            side: 0,
+            price: 99.52,
+            qty: 99,
+        })];
+        let update101 = deque.push_back_batch(levels.into_iter()).unwrap();
+        let result = buffered_book.apply_update(OrderBookUpdate {
+            timestamp: 1627846266,
+            seq_no: 101,
+            security_id,
+            updates: update101,
+        });
         // Should successfully apply both the gap-filling update and the pending update
         assert!(result.is_ok());
         assert_eq!(buffered_book.order_book.seq_no, 103);

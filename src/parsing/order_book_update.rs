@@ -1,12 +1,9 @@
-use crate::generational_deque::generation_guard::GenerationGuard;
-use crate::generational_deque::generational_deque::GenerationalDeque;
-use crate::generational_deque::generational_deque::Item as GenerationalItem;
+use crate::batched_deque::batched_deque::BatchGuard;
+use crate::batched_deque::batched_deque::BatchedDeque;
 use crate::parsing::parser::ParserError;
 use crate::parsing::parser::{DefaultParser, Parser};
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{self, Read};
-use std::rc::Rc;
 
 const DEFAULT_UPDATE_DEQUE_CAPACITY: usize = 10_000;
 const MAX_NUM_UPDATES: usize = 100_000;
@@ -16,7 +13,6 @@ pub struct Level {
     pub side: u8,
     pub price: f64,
     pub qty: u64,
-    pub seq_no: u64,
 }
 
 #[derive(Debug)]
@@ -24,13 +20,11 @@ pub struct OrderBookUpdate {
     pub timestamp: u64,
     pub seq_no: u64,
     pub security_id: u64,
-    pub updates: GenerationGuard<Level>,
+    pub updates: BatchGuard<Level>,
 }
 
 #[derive(Debug)]
-struct LevelParser {
-    seq_no: u64,
-}
+struct LevelParser;
 
 impl Parser<Level> for LevelParser {
     fn read<R: Read>(&mut self, reader: &mut R) -> Result<Level, ParserError> {
@@ -52,25 +46,14 @@ impl Parser<Level> for LevelParser {
             reader.read_exact(&mut qty).map_err(ParserError::Io)?;
             u64::from_le_bytes(qty)
         };
-        Ok(Level {
-            side,
-            price,
-            qty,
-            seq_no: self.seq_no,
-        })
-    }
-}
-
-impl GenerationalItem for Level {
-    fn generation(&self) -> usize {
-        self.seq_no as usize
+        Ok(Level { side, price, qty })
     }
 }
 
 #[derive(Debug, Default)]
 pub struct OrderBookUpdateParser {
-    // each security_id has its own deque for updates
-    security_id_to_deque: HashMap<u64, Rc<RefCell<GenerationalDeque<Level>>>>,
+    // Each security_id has its own deque for updates
+    security_id_to_deque: HashMap<u64, BatchedDeque<Level>>,
 }
 
 impl DefaultParser<OrderBookUpdate> for OrderBookUpdate {
@@ -126,36 +109,19 @@ impl Parser<OrderBookUpdate> for OrderBookUpdateParser {
             }
             num_updates
         };
-        // get or create a deque with updates for security_id
+
         let deque = self
             .security_id_to_deque
             .entry(security_id)
-            .or_insert_with(|| {
-                Rc::new(RefCell::new(GenerationalDeque::new(
-                    DEFAULT_UPDATE_DEQUE_CAPACITY,
-                )))
-            });
+            .or_insert_with(|| BatchedDeque::new(DEFAULT_UPDATE_DEQUE_CAPACITY));
 
-        let start_index = deque.borrow().end_index();
-        // parse updates and push them to the ring buffer
-        {
-            let mut level_parser = LevelParser { seq_no };
-            let mut deque_ref = deque.borrow_mut();
-            for _ in 0..num_updates {
-                let level = level_parser.read(reader)?;
-                deque_ref.push_back(level);
-            }
-        }
+        let levels_iter = (0..num_updates).map(move |_| LevelParser.read(reader));
+
         Ok(OrderBookUpdate {
             timestamp,
             seq_no,
             security_id,
-            updates: GenerationGuard::new(
-                Rc::clone(deque),
-                start_index,
-                num_updates,
-                seq_no as usize,
-            ),
+            updates: deque.push_back_batch(levels_iter)?,
         })
     }
 }
@@ -214,7 +180,6 @@ mod tests {
         update
             .updates
             .for_each(|level| {
-                assert_eq!(level.seq_no, 42);
                 assert_eq!(level.side, if count % 2 == 0 { 0 } else { 1 });
                 assert_eq!(level.price, 1000.0 + (count as f64) * 0.5);
                 assert_eq!(level.qty, 100 + (count as u64) * 10);
@@ -252,8 +217,27 @@ mod tests {
 
         // Check that updates were added to the same deque
         assert_eq!(parser.security_id_to_deque.len(), 1);
-        let deque = parser.security_id_to_deque.get(&123456).unwrap();
-        assert_eq!(deque.borrow().end_index(), 6); // 3 updates from each parse
+
+        // Verify the number of updates through for_each
+        let mut count = 0;
+        update1
+            .updates
+            .for_each(|_| {
+                count += 1;
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+        assert_eq!(count, num_updates);
+
+        count = 0;
+        update2
+            .updates
+            .for_each(|_| {
+                count += 1;
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+        assert_eq!(count, num_updates);
     }
 
     #[test]
@@ -325,16 +309,10 @@ mod tests {
         data.extend_from_slice(&789u64.to_le_bytes()); // qty
 
         let mut cursor = Cursor::new(data);
-        let mut parser = LevelParser { seq_no: 42 };
-
-        let result = parser.read(&mut cursor);
-        assert!(result.is_ok());
-
-        let level = result.unwrap();
+        let level = LevelParser.read(&mut cursor).unwrap();
         assert_eq!(level.side, 1);
         assert_eq!(level.price, 123.45);
         assert_eq!(level.qty, 789);
-        assert_eq!(level.seq_no, 42);
     }
 
     #[test]
@@ -394,20 +372,11 @@ mod tests {
         // Check that we have two different deques for different security IDs
         assert_eq!(parser.security_id_to_deque.len(), 2);
 
-        // Check the first security ID's deque
-        let deque1 = parser.security_id_to_deque.get(&111111).unwrap();
-        assert_eq!(deque1.borrow().end_index(), 3); // 3 updates
-
-        // Check the second security ID's deque
-        let deque2 = parser.security_id_to_deque.get(&222222).unwrap();
-        assert_eq!(deque2.borrow().end_index(), 3); // 3 updates
-
-        // Verify the contents of the first update's levels
+        // Verify the contents of the first update's levels through counting
         let mut count1 = 0;
         update1
             .updates
             .for_each(|level| {
-                assert_eq!(level.seq_no, 42);
                 assert_eq!(level.side, if count1 % 2 == 0 { 0 } else { 1 });
                 assert_eq!(level.price, 1000.0 + (count1 as f64) * 0.5);
                 assert_eq!(level.qty, 100 + (count1 as u64) * 10);
@@ -422,7 +391,6 @@ mod tests {
         update2
             .updates
             .for_each(|level| {
-                assert_eq!(level.seq_no, 43);
                 assert_eq!(level.side, if count2 % 2 == 0 { 0 } else { 1 });
                 assert_eq!(level.price, 2000.0 + (count2 as f64) * 0.5);
                 assert_eq!(level.qty, 200 + (count2 as u64) * 10);

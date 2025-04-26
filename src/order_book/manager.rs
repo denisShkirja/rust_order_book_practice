@@ -48,12 +48,9 @@ impl Display for Manager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generational_deque::generation_guard::GenerationGuard;
-    use crate::generational_deque::generational_deque::GenerationalDeque;
+    use crate::batched_deque::batched_deque::BatchedDeque;
     use crate::parsing::order_book_snapshot::Level as SnapshotLevel;
     use crate::parsing::order_book_update::Level as UpdateLevel;
-    use std::cell::RefCell;
-    use std::rc::Rc;
 
     fn create_test_snapshot(security_id: u64, seq_no: u64) -> OrderBookSnapshot {
         OrderBookSnapshot {
@@ -105,32 +102,25 @@ mod tests {
 
     fn create_test_update(security_id: u64, seq_no: u64) -> OrderBookUpdate {
         // Create a deque and add test levels
-        let deque = Rc::new(RefCell::new(GenerationalDeque::new(10)));
-        let start_index = deque.borrow().end_index();
-
-        {
-            let mut deque_ref = deque.borrow_mut();
-            // Add bid level
-            deque_ref.push_back(UpdateLevel {
+        let deque = BatchedDeque::new(10);
+        let levels: Vec<Result<UpdateLevel, ()>> = vec![
+            Ok(UpdateLevel {
                 side: 0,
                 price: 99.00,
                 qty: 25,
-                seq_no,
-            });
-            // Add ask level
-            deque_ref.push_back(UpdateLevel {
+            }),
+            Ok(UpdateLevel {
                 side: 1,
                 price: 101.00,
                 qty: 30,
-                seq_no,
-            });
-        }
+            }),
+        ];
 
         OrderBookUpdate {
             timestamp: 1627846266,
             seq_no,
             security_id,
-            updates: GenerationGuard::new(Rc::clone(&deque), start_index, 2, seq_no as usize),
+            updates: deque.push_back_batch(levels.into_iter()).unwrap(),
         }
     }
 

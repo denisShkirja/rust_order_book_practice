@@ -4,7 +4,7 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-mod generational_deque;
+mod batched_deque;
 mod order_book;
 mod parsing;
 
